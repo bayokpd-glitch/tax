@@ -1,0 +1,194 @@
+name: Render Release Zips
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag that contains one or more zip assets, for example v1"
+        required: true
+        default: "v1"
+      renderer_kind:
+        description: "Renderer key from renderers.json, or auto"
+        required: true
+        default: "auto"
+      videos_parallel:
+        description: "How many videos to render at the same time"
+        required: true
+        default: "5"
+      remotion_concurrency:
+        description: "Requested Remotion concurrency per video"
+        required: true
+        default: "2"
+
+permissions:
+  contents: write
+
+jobs:
+  find-release-zips:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout renderer
+        uses: actions/checkout@v4
+
+      - name: Download release zip assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p release-zips
+          gh release download "$RELEASE_TAG" --pattern "*.zip" --dir release-zips
+
+      - name: Build render matrix
+        id: matrix
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          zips = sorted(Path("release-zips").glob("*.zip"))
+          if not zips:
+              raise SystemExit("No zip assets were found in this release.")
+
+          include = []
+          for path in zips:
+              stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._") or "video"
+              include.append({"zip": path.name, "stem": stem})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("matrix=" + json.dumps({"include": include}) + "\n")
+          PY
+
+  render:
+    needs: find-release-zips
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.videos_parallel) }}
+      matrix: ${{ fromJSON(needs.find-release-zips.outputs.matrix) }}
+    steps:
+      - name: Checkout renderer
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install renderer dependencies
+        run: npm ci
+
+      - name: Download story package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ZIP_NAME: ${{ matrix.zip }}
+        run: |
+          mkdir -p release-zips
+          gh release download "$RELEASE_TAG" --pattern "$ZIP_NAME" --dir release-zips
+          rm -rf public out
+          mkdir -p public out
+          unzip -q "release-zips/$ZIP_NAME" -d public
+
+      - name: Detect renderer
+        id: detect
+        env:
+          REQUESTED_RENDERER: ${{ inputs.renderer_kind }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          requested = os.environ.get("REQUESTED_RENDERER", "auto").strip() or "auto"
+          renderers = json.loads(Path("renderers.json").read_text(encoding="utf-8"))
+
+          if requested != "auto":
+              if requested not in renderers:
+                  raise SystemExit(f"Unknown renderer_kind '{requested}'. Add it to renderers.json first.")
+              selected = requested
+          else:
+              selected = ""
+              for name, config in renderers.items():
+                  marker = str(config.get("marker") or "").strip()
+                  if marker and (Path("public") / marker).exists():
+                      selected = name
+                      break
+              if not selected:
+                  raise SystemExit("Could not auto-detect this zip. Add a marker entry to renderers.json.")
+
+          composition = str(renderers[selected]["composition"])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"renderer={selected}\n")
+              out.write(f"composition={composition}\n")
+          print(f"Renderer: {selected}")
+          print(f"Composition: {composition}")
+          PY
+
+      - name: Render video
+        env:
+          COMPOSITION: ${{ steps.detect.outputs.composition }}
+          STEM: ${{ matrix.stem }}
+          REQUESTED_CONCURRENCY: ${{ inputs.remotion_concurrency }}
+        run: |
+          CORES="$(getconf _NPROCESSORS_ONLN || echo 2)"
+          if [ "$REQUESTED_CONCURRENCY" -gt "$CORES" ]; then
+            SAFE_CONCURRENCY="$CORES"
+          else
+            SAFE_CONCURRENCY="$REQUESTED_CONCURRENCY"
+          fi
+          echo "Using Remotion concurrency $SAFE_CONCURRENCY on $CORES CPU cores"
+          npx remotion render src/index.ts "$COMPOSITION" "out/$STEM.mp4" --concurrency="$SAFE_CONCURRENCY"
+
+      - name: Upload rendered MP4 to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          STEM: ${{ matrix.stem }}
+        run: |
+          gh release upload "$RELEASE_TAG" "out/$STEM.mp4" --clobber
+
+  collect-videos:
+    needs:
+      - find-release-zips
+      - render
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout renderer
+        uses: actions/checkout@v4
+
+      - name: Download rendered MP4 release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RENDER_MATRIX: ${{ needs.find-release-zips.outputs.matrix }}
+        run: |
+          mkdir -p rendered
+          python3 - <<'PY' > expected-mp4s.txt
+          import json
+          import os
+          matrix = json.loads(os.environ["RENDER_MATRIX"])
+          for item in matrix.get("include", []):
+              print(f"{item['stem']}.mp4")
+          PY
+          while IFS= read -r mp4; do
+            gh release download "$RELEASE_TAG" --pattern "$mp4" --dir rendered
+          done < expected-mp4s.txt
+
+      - name: Create combined zip
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          cd rendered
+          zip -r "../rendered-videos-$RELEASE_TAG.zip" .
+
+      - name: Upload combined zip to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" "rendered-videos-$RELEASE_TAG.zip" --clobber

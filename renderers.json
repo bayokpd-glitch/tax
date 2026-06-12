@@ -1,0 +1,17 @@
+{
+  "avatar-tax": {
+    "marker": "avatar_plan.json",
+    "composition": "AvatarTax",
+    "description": "Talking-head avatar tax packages from Avatar Tax Factory"
+  },
+  "flash-news": {
+    "marker": "scenes.json",
+    "composition": "NewsFlash",
+    "description": "Flash news packages from Flash News Factory"
+  },
+  "archive-documentary": {
+    "marker": "archive.json",
+    "composition": "ArchiveDocumentary",
+    "description": "Archive documentary packages from Archive Remotion Factory"
+  }
+}
