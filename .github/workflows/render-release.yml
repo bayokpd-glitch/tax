@@ -254,6 +254,7 @@ jobs:
       - name: Upload final video to release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           gh release upload "$RELEASE_TAG" "out/${{ matrix.stem }}.mp4" --clobber
