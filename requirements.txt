@@ -1,0 +1,5 @@
+requests
+python-dotenv
+pillow
+openai
+faster-whisper

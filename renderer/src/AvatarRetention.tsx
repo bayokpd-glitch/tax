@@ -105,6 +105,9 @@ const editorialCardKinds = new Set([
   'money_leak',
   'checklist_reveal',
   'document_scan',
+  'stat_counter',
+  'bar_chart',
+  'donut_chart',
   'tax_card',
   'warning_card',
   'deadline_card',
@@ -135,8 +138,8 @@ const SfxLayer = ({data}: {data: AvatarPlan}) => {
       {data.overlays.map((overlay, index) => {
         const src = sourceFor(overlay.sfx);
         if (!src) return null;
-        const duration = overlay.sfx === 'whoosh' ? 18 : overlay.sfx === 'hit' ? 14 : 9;
-        const volume = overlay.sfx === 'hit' ? 0.11 : overlay.sfx === 'whoosh' ? 0.09 : 0.07;
+        const duration = overlay.sfx === 'whoosh' ? 24 : overlay.sfx === 'hit' ? 28 : overlay.sfx === 'pop' ? 10 : 6;
+        const volume = overlay.sfx === 'hit' ? 0.13 : overlay.sfx === 'whoosh' ? 0.11 : overlay.sfx === 'pop' ? 0.09 : 0.08;
         return (
           <Sequence key={`sfx-${index}`} from={Math.round(overlay.time * fps)} durationInFrames={duration}>
             <Audio src={staticFile(src)} volume={volume} />
@@ -147,8 +150,8 @@ const SfxLayer = ({data}: {data: AvatarPlan}) => {
         const src = sourceFor('whoosh');
         if (!src) return null;
         return (
-          <Sequence key={`image-sfx-${index}`} from={Math.round(image.time * fps)} durationInFrames={18}>
-            <Audio src={staticFile(src)} volume={0.075} />
+          <Sequence key={`image-sfx-${index}`} from={Math.round(image.time * fps)} durationInFrames={24}>
+            <Audio src={staticFile(src)} volume={0.09} />
           </Sequence>
         );
       })}
@@ -197,7 +200,7 @@ const OverlayLayer = ({overlay}: {overlay: OverlayEvent}) => {
     return <TitleCard overlay={overlay} local={local} duration={duration} />;
   }
   if (avatarCalloutKinds.has(overlay.kind)) {
-    return <FullCardCallout overlay={overlay} local={local} duration={duration} />;
+    return <AvatarCallout overlay={overlay} local={local} duration={duration} />;
   }
   if (editorialCardKinds.has(overlay.kind)) {
     return <EditorialCard overlay={overlay} local={local} duration={duration} />;
@@ -205,34 +208,100 @@ const OverlayLayer = ({overlay}: {overlay: OverlayEvent}) => {
   return null;
 };
 
-const FullCardCallout = ({overlay, local, duration}: {overlay: OverlayEvent; local: number; duration: number}) => {
-  const {fps} = useVideoConfig();
-  const pop = spring({frame: local, fps, config: {damping: 17, stiffness: 125}});
-  const out = interpolate(local, [duration - 12, duration], [1, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
-  const line = interpolate(local, [12, 28], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
-  const underline = interpolate(local, [10, 28], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
-  const isCorrection = overlay.kind === 'strike_callout' || overlay.kind === 'mistake_strip';
-  const label = overlay.label || (isCorrection ? 'WATCH THIS' : 'TAX NOTE');
+const AvatarCallout = ({overlay, local, duration}: {overlay: OverlayEvent; local: number; duration: number}) => {
+  if (overlay.kind === 'strike_callout') {
+    return <StrikeCallout overlay={overlay} local={local} duration={duration} />;
+  }
+  if (overlay.kind === 'mistake_strip') {
+    return <MistakeStrip overlay={overlay} local={local} duration={duration} />;
+  }
+  if (overlay.kind === 'soft_caption') {
+    return <SoftCaption overlay={overlay} local={local} duration={duration} />;
+  }
+  return <UnderlineCallout overlay={overlay} local={local} duration={duration} />;
+};
+
+const UnderlineCallout = ({overlay, local, duration}: {overlay: OverlayEvent; local: number; duration: number}) => {
+  const opacity = calloutOpacity(local, duration);
+  const y = interpolate(local, [0, 14], [24, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  const underline = interpolate(local, [8, 24], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
   return (
-    <AbsoluteFill style={{...styles.editorialStage, opacity: out}}>
-      <CameraMotionBlur shutterAngle={95} samples={6}>
-        <div
-          style={{
-            ...styles.fullCalloutCard,
-            transform: `translateY(${(1 - pop) * 34}px) scale(${0.965 + pop * 0.035})`,
-          }}
-        >
-          <div style={{...styles.fullCalloutLabel, color: isCorrection ? '#ff4d4d' : '#555555'}}>{label}</div>
-          <div style={styles.fullCalloutTextWrap}>
-            <div style={styles.fullCalloutText}>{overlay.text.toUpperCase()}</div>
-            {isCorrection ? <div style={{...styles.fullCalloutStrike, width: `${line}%`}} /> : null}
-          </div>
-          {!isCorrection ? <div style={{...styles.fullCalloutUnderline, width: `${underline}%`}} /> : null}
-        </div>
-      </CameraMotionBlur>
-    </AbsoluteFill>
+    <div style={{...styles.underlineCallout, opacity, transform: `translate(-50%, ${y}px)`}}>
+      <ProgressiveWords text={overlay.text} local={local} />
+      <div style={{...styles.yellowUnderline, width: `${underline}%`}} />
+    </div>
   );
 };
+
+const StrikeCallout = ({overlay, local, duration}: {overlay: OverlayEvent; local: number; duration: number}) => {
+  const opacity = calloutOpacity(local, duration);
+  const y = interpolate(local, [0, 12], [18, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  const strike = interpolate(local, [14, 28], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  return (
+    <div style={{...styles.strikeCallout, opacity, transform: `translate(-50%, ${y}px)`}}>
+      <ProgressiveWords text={overlay.text} local={local} />
+      <div style={{...styles.redStrike, width: `${strike}%`}} />
+    </div>
+  );
+};
+
+const SoftCaption = ({overlay, local, duration}: {overlay: OverlayEvent; local: number; duration: number}) => {
+  const opacity = calloutOpacity(local, duration);
+  const x = interpolate(local, [0, 14], [-28, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  const underline = interpolate(local, [10, 28], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  return (
+    <div style={{...styles.softCaption, opacity, transform: `translateX(${x}px)`}}>
+      <div style={styles.softCaptionLabel}>{overlay.label || 'TAX NOTE'}</div>
+      <ProgressiveWords text={overlay.text} local={local} />
+      <div style={{...styles.softCaptionUnderline, width: `${underline}%`}} />
+    </div>
+  );
+};
+
+const MistakeStrip = ({overlay, local, duration}: {overlay: OverlayEvent; local: number; duration: number}) => {
+  const opacity = calloutOpacity(local, duration);
+  const items = overlayItems(overlay);
+  const wrong = items[0] || overlay.text;
+  const strike = interpolate(local, [12, 26], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  const y = interpolate(local, [0, 12], [18, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  return (
+    <div style={{...styles.mistakeStrip, opacity, transform: `translate(-50%, ${y}px)`}}>
+      <span style={styles.mistakeWrong}>
+        {wrong.toUpperCase()}
+        <span style={{...styles.inlineStrike, width: `${strike}%`}} />
+      </span>
+    </div>
+  );
+};
+
+const ProgressiveWords = ({text, local}: {text: string; local: number}) => {
+  const words = text.toUpperCase().split(/\s+/).filter(Boolean).slice(0, 7);
+  return (
+    <span>
+      {words.map((word, index) => {
+        const opacity = interpolate(local, [index * 3, index * 3 + 9], [0, 1], {
+          extrapolateLeft: 'clamp',
+          extrapolateRight: 'clamp',
+        });
+        const y = interpolate(local, [index * 3, index * 3 + 9], [16, 0], {
+          extrapolateLeft: 'clamp',
+          extrapolateRight: 'clamp',
+        });
+        return (
+          <span key={`${word}-${index}`} style={{...styles.progressiveWord, opacity, transform: `translateY(${y}px)`}}>
+            {word}
+          </span>
+        );
+      })}
+    </span>
+  );
+};
+
+const calloutOpacity = (local: number, duration: number) =>
+  Math.min(
+    interpolate(local, [0, 8], [0, 1], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}),
+    interpolate(local, [duration - 10, duration], [1, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}),
+  );
 
 const titleWithoutDuplicateNumber = (text: string, number?: number) => {
   const trimmed = text.trim();
@@ -288,6 +357,12 @@ const EditorialCard = ({overlay, local, duration}: {overlay: OverlayEvent; local
             <DeadlineFlip overlay={overlay} icon={Icon} value={value} />
           ) : kind === 'money_leak' ? (
             <MoneyLeak overlay={overlay} local={local} duration={duration} />
+          ) : kind === 'stat_counter' ? (
+            <StatCounter overlay={overlay} local={local} />
+          ) : kind === 'bar_chart' ? (
+            <BarChartCard overlay={overlay} local={local} />
+          ) : kind === 'donut_chart' ? (
+            <DonutChartCard overlay={overlay} local={local} />
           ) : kind === 'checklist_reveal' ? (
             <ChecklistReveal overlay={overlay} icon={Icon} local={local} items={items} />
           ) : kind === 'document_scan' ? (
@@ -492,6 +567,114 @@ const MoneyLeak = ({overlay, local, duration}: {overlay: OverlayEvent; local: nu
   );
 };
 
+const parseStatValue = (value?: string) => {
+  const raw = (value ?? '').trim();
+  const match = raw.match(/-?\d[\d,]*(?:\.\d+)?/);
+  const numeric = match ? Number(match[0].replace(/,/g, '')) : NaN;
+  const prefix = raw.includes('$') ? '$' : '';
+  const suffixMatch = raw.match(/(%|K|M|B)\s*$/i);
+  const suffix = suffixMatch ? suffixMatch[1].toUpperCase() : '';
+  return {numeric: Number.isFinite(numeric) ? numeric : 0, prefix, suffix: suffix === '%' ? '%' : suffix};
+};
+
+const formatStatNumber = (value: number) =>
+  Number.isInteger(value) || Math.abs(value) >= 100 ? d3Format(',.0f')(value) : d3Format(',.1f')(value);
+
+const countUpEase = (local: number, frames = 42) => easeOutExpo(clamp01(local / frames));
+
+const StatCounter = ({overlay, local}: {overlay: OverlayEvent; local: number}) => {
+  const {fps} = useVideoConfig();
+  const pop = spring({frame: local, fps, config: {damping: 16, stiffness: 130}});
+  const {numeric, prefix, suffix} = parseStatValue(overlay.value);
+  const shown = numeric * countUpEase(local);
+  const underline = interpolate(local, [16, 34], [0, 100], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  return (
+    <div style={styles.statCard}>
+      <div style={styles.impactLabel}>{overlay.label || 'THE REAL NUMBER'}</div>
+      <div style={{...styles.statNumber, transform: `translateY(${(1 - pop) * 30}px) scale(${0.94 + pop * 0.06})`}}>
+        {prefix}
+        {formatStatNumber(shown)}
+        {suffix}
+      </div>
+      <div style={styles.statHeadline}>{overlay.text.toUpperCase()}</div>
+      <div style={{...styles.impactUnderline, width: `${underline}%`}} />
+    </div>
+  );
+};
+
+const BarChartCard = ({overlay, local}: {overlay: OverlayEvent; local: number}) => {
+  const data = (overlay.data ?? []).filter((entry) => Number.isFinite(entry.value)).slice(0, 5);
+  if (!data.length) return <MoneyLeak overlay={overlay} local={local} duration={9999} />;
+  const max = Math.max(...data.map((entry) => Math.abs(entry.value)), 1);
+  const prefix = overlay.value?.includes('$') || data.some((entry) => entry.value >= 1000) ? '$' : '';
+  return (
+    <div style={styles.chartCard}>
+      <div style={styles.impactLabel}>{overlay.label || 'BY THE NUMBERS'}</div>
+      <div style={styles.chartHeadline}>{overlay.text.toUpperCase()}</div>
+      <div style={styles.barRows}>
+        {data.map((entry, index) => {
+          const grow = easeOutExpo(clamp01((local - 8 - index * 6) / 26));
+          const width = Math.max(0.02, (Math.abs(entry.value) / max) * grow) * 100;
+          const shown = entry.value * grow;
+          return (
+            <div key={`${entry.label}-${index}`} style={styles.barRow}>
+              <div style={styles.barLabel}>{entry.label.toUpperCase()}</div>
+              <div style={styles.barTrack}>
+                <div
+                  style={{
+                    ...styles.barFill,
+                    width: `${width}%`,
+                    backgroundColor: index === 0 ? '#ffd43b' : '#111111',
+                  }}
+                />
+                <span style={{...styles.barValue, opacity: grow}}>
+                  {prefix}
+                  {formatStatNumber(shown)}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+const DonutChartCard = ({overlay, local}: {overlay: OverlayEvent; local: number}) => {
+  const {numeric} = parseStatValue(overlay.value);
+  const percent = Math.max(0, Math.min(100, numeric));
+  const progress = countUpEase(local, 48);
+  const shown = percent * progress;
+  const radius = 150;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <div style={styles.donutCard}>
+      <div style={styles.donutChartBox}>
+        <svg width={380} height={380} viewBox="0 0 380 380">
+          <circle cx={190} cy={190} r={radius} fill="none" stroke="rgba(17,17,17,.12)" strokeWidth={44} />
+          <circle
+            cx={190}
+            cy={190}
+            r={radius}
+            fill="none"
+            stroke="#ffd43b"
+            strokeWidth={44}
+            strokeLinecap="butt"
+            strokeDasharray={circumference}
+            strokeDashoffset={circumference * (1 - shown / 100)}
+            transform="rotate(-90 190 190)"
+          />
+        </svg>
+        <div style={styles.donutValue}>{d3Format('.0f')(shown)}%</div>
+      </div>
+      <div style={styles.donutText}>
+        <div style={styles.impactLabel}>{overlay.label || 'THE PERCENTAGE'}</div>
+        <div style={styles.donutHeadline}>{overlay.text.toUpperCase()}</div>
+      </div>
+    </div>
+  );
+};
+
 const normalizeChecklistItem = (item: string) => item.toUpperCase().replace(/[^A-Z0-9]+/g, '');
 
 const checklistDisplayItems = (overlay: OverlayEvent, items: string[]) => {
@@ -595,6 +778,7 @@ const toneFromKind = (kind: OverlayEvent['kind']) => {
   if (kind === 'mistake_teardown' || kind === 'warning_card') return 'warning';
   if (kind === 'deadline_flip' || kind === 'deadline_card') return 'deadline';
   if (kind === 'money_leak' || kind === 'money_card') return 'money';
+  if (kind === 'stat_counter' || kind === 'bar_chart' || kind === 'donut_chart') return 'money';
   if (kind === 'document_scan') return 'audit';
   return 'audit';
 };
@@ -737,51 +921,6 @@ const styles: Record<string, CSSProperties> = {
     lineHeight: 1.02,
     fontWeight: 900,
     letterSpacing: 0,
-  },
-  fullCalloutCard: {
-    width: '100%',
-    height: '100%',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    textAlign: 'center',
-    padding: '0 180px',
-    willChange: 'transform',
-  },
-  fullCalloutLabel: {
-    fontSize: 30,
-    fontWeight: 900,
-    textTransform: 'uppercase',
-    marginBottom: 22,
-  },
-  fullCalloutTextWrap: {
-    position: 'relative',
-    display: 'inline-block',
-    maxWidth: 1220,
-  },
-  fullCalloutText: {
-    fontSize: 74,
-    lineHeight: 1.03,
-    fontWeight: 1000,
-    letterSpacing: 0,
-  },
-  fullCalloutStrike: {
-    position: 'absolute',
-    left: '50%',
-    top: '54%',
-    height: 10,
-    backgroundColor: '#ff4d4d',
-    transform: 'translateX(-50%)',
-    transformOrigin: 'center center',
-    boxShadow: '0 8px 20px rgba(255,77,77,.22)',
-  },
-  fullCalloutUnderline: {
-    height: 12,
-    backgroundColor: '#ffd43b',
-    marginTop: 24,
-    maxWidth: 720,
-    boxShadow: '0 10px 26px rgba(0,0,0,.12)',
   },
   underlineCallout: {
     position: 'absolute',
@@ -1204,6 +1343,110 @@ const styles: Record<string, CSSProperties> = {
     marginTop: 28,
     transformOrigin: 'center',
     boxShadow: '0 10px 24px rgba(0,0,0,.12)',
+  },
+  statCard: {
+    width: 1220,
+    minHeight: 470,
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '68px 88px',
+    color: '#111111',
+  },
+  statNumber: {
+    fontSize: 190,
+    fontWeight: 1000,
+    lineHeight: 1,
+    letterSpacing: -4,
+    fontVariantNumeric: 'tabular-nums',
+  },
+  statHeadline: {
+    maxWidth: 980,
+    textAlign: 'center',
+    fontSize: 44,
+    fontWeight: 950,
+    lineHeight: 1.06,
+    color: '#333333',
+    marginTop: 22,
+  },
+  chartCard: {
+    width: 1240,
+    minHeight: 560,
+    padding: '58px 78px',
+    color: '#111111',
+  },
+  chartHeadline: {
+    fontSize: 54,
+    fontWeight: 1000,
+    lineHeight: 1.04,
+    maxWidth: 1000,
+    marginBottom: 44,
+  },
+  barRows: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 26,
+  },
+  barRow: {
+    display: 'grid',
+    gridTemplateColumns: '300px 1fr',
+    alignItems: 'center',
+    columnGap: 30,
+  },
+  barLabel: {
+    fontSize: 32,
+    fontWeight: 950,
+    textAlign: 'right',
+    lineHeight: 1.04,
+  },
+  barTrack: {
+    position: 'relative',
+    height: 62,
+    backgroundColor: 'rgba(17,17,17,.08)',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  barFill: {
+    height: '100%',
+    boxShadow: '0 12px 30px rgba(0,0,0,.12)',
+  },
+  barValue: {
+    position: 'absolute',
+    right: 18,
+    fontSize: 32,
+    fontWeight: 1000,
+    fontVariantNumeric: 'tabular-nums',
+  },
+  donutCard: {
+    width: 1240,
+    minHeight: 520,
+    display: 'grid',
+    gridTemplateColumns: '420px 1fr',
+    alignItems: 'center',
+    columnGap: 64,
+    padding: '48px 70px',
+    color: '#111111',
+  },
+  donutChartBox: {
+    position: 'relative',
+    width: 380,
+    height: 380,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  donutValue: {
+    position: 'absolute',
+    fontSize: 84,
+    fontWeight: 1000,
+    fontVariantNumeric: 'tabular-nums',
+  },
+  donutHeadline: {
+    fontSize: 58,
+    fontWeight: 1000,
+    lineHeight: 1.04,
+    maxWidth: 720,
   },
   checklistCard: {
     width: 1180,

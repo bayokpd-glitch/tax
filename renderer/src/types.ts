@@ -25,6 +25,9 @@ export type OverlayEvent = {
     | 'money_leak'
     | 'checklist_reveal'
     | 'document_scan'
+    | 'stat_counter'
+    | 'bar_chart'
+    | 'donut_chart'
     | 'tax_card'
     | 'warning_card'
     | 'deadline_card'
@@ -36,6 +39,7 @@ export type OverlayEvent = {
   value?: string;
   label?: string;
   items?: string[];
+  data?: Array<{label: string; value: number}>;
   meter?: number;
   icon?: 'receipt' | 'warning' | 'calendar' | 'dollar' | 'check';
   tone?: 'money' | 'warning' | 'deadline' | 'audit' | 'neutral';

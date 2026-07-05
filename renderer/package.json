@@ -1,7 +1,7 @@
 {
-  "name": "universal-rendrer",
+  "name": "avatar-tax-renderer",
   "version": "1.0.0",
-  "description": "Universal Remotion release-zip renderer with niche adapters",
+  "description": "Remotion renderer for talking-head avatar retention edits",
   "private": true,
   "license": "UNLICENSED",
   "dependencies": {
