@@ -124,7 +124,7 @@ jobs:
         run: |
           mkdir -p package renderer/public renderer/out
           gh release download "$RELEASE_TAG" --pattern "${{ matrix.zip }}" --dir package
-          unzip -q "package/${{ matrix.zip }}" -d renderer/public
+          unzip -q -o "package/${{ matrix.zip }}" -d renderer/public
           find renderer/public -maxdepth 3 -type f | sed 's#^#  #'
 
       - name: Detect chunk frame range
