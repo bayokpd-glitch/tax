@@ -56,7 +56,8 @@ PLANNING_PROVIDER_LABELS = {
 }
 
 TRANSCRIPTION_PROVIDER_LABELS = {
-    "local_mac": "Local Mac (faster-whisper)",
+    "local_whisperx": "Local WhisperX (word-level sync)",
+    "local_mac": "Local faster-whisper",
     "openai_mini": "OpenAI gpt-4o-mini-transcribe",
     "none": "No transcription",
 }
@@ -168,9 +169,24 @@ class TranscriptChunk:
 
 
 @dataclass
+class TranscriptWord:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
+class SpeechSpan:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
 class TranscriptResult:
     text: str
     chunks: List[TranscriptChunk] = field(default_factory=list)
+    words: List[TranscriptWord] = field(default_factory=list)
 
 
 @dataclass
@@ -464,8 +480,9 @@ def transcribe_local(audio: Path, log: Any) -> TranscriptResult:
     compute_type = os.getenv("WHISPER_COMPUTE", "int8")
     log(f"Transcribing locally with faster-whisper ({model_name})...")
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    segments, _info = model.transcribe(str(audio), vad_filter=True)
+    segments, _info = model.transcribe(str(audio), vad_filter=True, word_timestamps=True)
     chunks: List[TranscriptChunk] = []
+    words: List[TranscriptWord] = []
     parts: List[str] = []
     for segment in segments:
         text = clean_text(segment.text.strip())
@@ -473,7 +490,71 @@ def transcribe_local(audio: Path, log: Any) -> TranscriptResult:
             continue
         parts.append(text)
         chunks.append(TranscriptChunk(round(float(segment.start), 2), round(float(segment.end), 2), text))
-    return TranscriptResult(clean_text(" ".join(parts)), chunks)
+        for word in segment.words or []:
+            token = clean_text(str(word.word or ""))
+            if token:
+                words.append(TranscriptWord(round(float(word.start), 2), round(float(word.end), 2), token))
+    return TranscriptResult(clean_text(" ".join(parts)), chunks, words)
+
+
+def transcribe_whisperx(audio: Path, log: Any) -> TranscriptResult:
+    try:
+        import whisperx
+    except Exception as exc:
+        raise RuntimeError("whisperx is not installed. Install it with: pip install whisperx") from exc
+
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE", "int8")
+    model_name = os.getenv("WHISPERX_MODEL", os.getenv("WHISPER_MODEL", "base"))
+    batch_size = int(os.getenv("WHISPERX_BATCH", "8"))
+    log(f"Transcribing with WhisperX ({model_name})...")
+    model = whisperx.load_model(model_name, device, compute_type=compute_type)
+    audio_data = whisperx.load_audio(str(audio))
+    result = model.transcribe(audio_data, batch_size=batch_size)
+    language = str(result.get("language") or "en")
+    try:
+        align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
+        result = whisperx.align(
+            result["segments"], align_model, metadata, audio_data, device, return_char_alignments=False
+        )
+        log("WhisperX word-level alignment complete.")
+    except Exception as exc:
+        log(f"WhisperX alignment unavailable, keeping segment timing: {brief_error(exc, 200)}")
+
+    chunks: List[TranscriptChunk] = []
+    words: List[TranscriptWord] = []
+    parts: List[str] = []
+    for segment in result.get("segments") or []:
+        text = clean_text(str(segment.get("text") or ""))
+        if not text:
+            continue
+        parts.append(text)
+        chunks.append(
+            TranscriptChunk(round(float(segment.get("start") or 0), 2), round(float(segment.get("end") or 0), 2), text)
+        )
+        for word in segment.get("words") or []:
+            if word.get("start") is None or word.get("end") is None:
+                continue
+            token = clean_text(str(word.get("word") or ""))
+            if token:
+                words.append(TranscriptWord(round(float(word["start"]), 2), round(float(word["end"]), 2), token))
+    return TranscriptResult(clean_text(" ".join(parts)), chunks, words)
+
+
+def words_from_chunks(chunks: List[TranscriptChunk]) -> List[TranscriptWord]:
+    """Approximate word timing by spreading each chunk's words across its span.
+    Used when the transcription backend gives no word-level timestamps."""
+    words: List[TranscriptWord] = []
+    for chunk in chunks:
+        tokens = chunk.text.split()
+        if not tokens:
+            continue
+        span = max(0.2, chunk.end - chunk.start)
+        step = span / len(tokens)
+        for i, token in enumerate(tokens):
+            start = chunk.start + i * step
+            words.append(TranscriptWord(round(start, 2), round(min(chunk.end, start + step), 2), token))
+    return words
 
 
 def transcribe_openai(audio: Path, log: Any) -> TranscriptResult:
@@ -1172,6 +1253,226 @@ def generated_zoom_segments(start: float, end: float, previous_scale: float = 1.
     return events
 
 
+SYNC_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def speech_sentence_spans(words: List[TranscriptWord], max_span_seconds: float = 14.0) -> List[SpeechSpan]:
+    """Group word timestamps into spoken sentences so visuals can hold for the
+    exact time a point is being made."""
+    spans: List[SpeechSpan] = []
+    bucket: List[TranscriptWord] = []
+    for word in words:
+        if bucket and word.start - bucket[-1].end > 1.6:
+            spans.append(SpeechSpan(bucket[0].start, bucket[-1].end, " ".join(w.text for w in bucket)))
+            bucket = []
+        bucket.append(word)
+        ends_sentence = bool(re.search(r"[.!?]$", word.text))
+        too_long = word.end - bucket[0].start >= max_span_seconds
+        if ends_sentence or too_long:
+            spans.append(SpeechSpan(bucket[0].start, word.end, " ".join(w.text for w in bucket)))
+            bucket = []
+    if bucket:
+        spans.append(SpeechSpan(bucket[0].start, bucket[-1].end, " ".join(w.text for w in bucket)))
+    return [span for span in spans if span.end > span.start]
+
+
+def sync_tokens(*texts: Any) -> set[str]:
+    tokens: set[str] = set()
+    for text in texts:
+        for token in SYNC_TOKEN_RE.findall(str(text or "").lower().replace(",", "").replace("$", " ").replace("%", " ")):
+            if token in STAT_HEADLINE_STOP:
+                continue
+            if len(token) < 3 and not token.isdigit():
+                continue
+            tokens.add(token)
+    return tokens
+
+
+def best_span_for_event(
+    spans: List[SpeechSpan],
+    timepoint: float,
+    tokens: set[str],
+    window_before: float = 8.0,
+    window_after: float = 14.0,
+) -> Optional[SpeechSpan]:
+    """Find the spoken sentence this visual belongs to: token overlap first,
+    proximity to the planned time as tiebreaker."""
+    best: Optional[SpeechSpan] = None
+    best_score = 0.0
+    for span in spans:
+        if span.end < timepoint - window_before or span.start > timepoint + window_after:
+            continue
+        span_tokens = sync_tokens(span.text)
+        overlap = len(tokens & span_tokens)
+        if not overlap:
+            continue
+        digit_hits = sum(1 for token in tokens & span_tokens if token.isdigit())
+        distance = abs(span.start - timepoint)
+        score = overlap + digit_hits * 2 - distance * 0.05
+        if score > best_score:
+            best_score = score
+            best = span
+    return best
+
+
+def span_containing(spans: List[SpeechSpan], timepoint: float) -> Optional[SpeechSpan]:
+    for span in spans:
+        if span.start - 0.3 <= timepoint <= span.end + 0.3:
+            return span
+    return None
+
+
+def sync_duration_bounds(kind: str, progressive: bool) -> Tuple[float, float]:
+    if kind == "title_card":
+        return (2.0, 4.5)
+    if kind in AVATAR_CALLOUT_KINDS:
+        return (2.2, 8.0)
+    if progressive:
+        return (2.6, 6.0)
+    if kind in DATA_VIZ_KINDS:
+        return (3.0, 10.0)
+    return (3.0, 12.0)
+
+
+def sync_plan_to_speech(plan: DirectorPlan, words: List[TranscriptWord], duration: float, log: Any = None) -> DirectorPlan:
+    """Snap every overlay/image to the sentence the voiceover is speaking and
+    hold it until that point finishes, like a manual edit would."""
+    spans = speech_sentence_spans(words)
+    if not spans:
+        return plan
+
+    synced = 0
+    for overlay in plan.overlays:
+        kind = str(overlay.get("kind") or "")
+        timepoint = float(overlay.get("time") or 0)
+        tokens = sync_tokens(
+            overlay.get("text"),
+            overlay.get("value"),
+            " ".join(str(item) for item in (overlay.get("items") or [])),
+        )
+        span = best_span_for_event(spans, timepoint, tokens)
+        exact = span is not None
+        if span is None:
+            span = span_containing(spans, timepoint)
+        if span is None:
+            continue
+        start = max(5.5, span.start if exact else timepoint)
+        low, high = sync_duration_bounds(kind, bool(overlay.get("progressive")))
+        hold = clamp_float(span.end + 0.45 - start, low, high)
+        if start + hold > duration - 0.5:
+            hold = max(low, duration - 0.5 - start)
+            if hold < low:
+                continue
+        overlay["time"] = round(start, 2)
+        overlay["duration"] = round(hold, 2)
+        synced += 1 if exact else 0
+
+    for image in plan.images:
+        tokens = sync_tokens(image.caption, image.query)
+        span = best_span_for_event(spans, image.time, tokens, window_before=6.0, window_after=12.0)
+        exact = span is not None
+        if span is None:
+            span = span_containing(spans, image.time)
+        if span is None:
+            continue
+        start = max(3.0, span.start if exact else image.time)
+        hold = clamp_float(span.end + 0.45 - start, 3.5, 10.0)
+        if start + hold > duration - 1.0:
+            hold = max(3.0, duration - 1.0 - start)
+        image.time = round(start, 2)
+        image.duration = round(hold, 2)
+        if exact:
+            synced += 1
+
+    if log:
+        log(f"Speech sync: matched {synced} visual(s) to exact voiceover sentences.")
+    return resolve_visual_conflicts(plan, duration)
+
+
+def resolve_visual_conflicts(plan: DirectorPlan, duration: float) -> DirectorPlan:
+    """After snapping to speech, re-space everything: full-screen visuals must
+    not overlap each other, and callouts must not sit on top of image inserts."""
+    plan.images.sort(key=lambda item: item.time)
+    plan.overlays.sort(key=lambda item: float(item.get("time") or 0))
+
+    # Full-screen events: image inserts + every non-callout overlay.
+    events: List[Tuple[float, str, Any]] = [("image", image.time, image) for image in plan.images]
+    events += [
+        ("card", float(overlay.get("time") or 0), overlay)
+        for overlay in plan.overlays
+        if str(overlay.get("kind") or "") not in AVATAR_CALLOUT_KINDS
+    ]
+    events.sort(key=lambda item: item[1])
+
+    dropped_cards: set[int] = set()
+    dropped_images: set[int] = set()
+    previous: Optional[Tuple[str, Any]] = None
+    previous_end = -999.0
+    for label, start, payload in events:
+        length = payload.duration if label == "image" else float(payload.get("duration") or 0)
+        if start < previous_end + 0.35 and previous is not None:
+            gap_start = start - 0.35
+            prev_label, prev_payload = previous
+            prev_start = prev_payload.time if prev_label == "image" else float(prev_payload.get("time") or 0)
+            trimmed = gap_start - prev_start
+            if trimmed >= 2.2:
+                if prev_label == "image":
+                    prev_payload.duration = round(trimmed, 2)
+                else:
+                    prev_payload["duration"] = round(trimmed, 2)
+            else:
+                # Not enough room to trim: the later, lower-priority event loses.
+                # Images and data visuals beat generic cards.
+                if label == "card" and str(payload.get("kind") or "") not in DATA_VIZ_KINDS:
+                    dropped_cards.add(id(payload))
+                    continue
+                if prev_label == "card":
+                    dropped_cards.add(id(prev_payload))
+                elif prev_label == "image":
+                    dropped_images.add(id(prev_payload))
+        previous = (label, payload)
+        previous_end = start + length
+
+    plan.overlays = [o for o in plan.overlays if id(o) not in dropped_cards]
+    plan.images = [img for img in plan.images if id(img) not in dropped_images]
+
+    # Callouts may not overlap anything full-screen (images or cards): trim
+    # before, slide after, or drop if there is no room either way.
+    blocking_windows = [(image.time, image.time + image.duration) for image in plan.images]
+    blocking_windows += [
+        (float(o.get("time") or 0), float(o.get("time") or 0) + float(o.get("duration") or 0))
+        for o in plan.overlays
+        if str(o.get("kind") or "") not in AVATAR_CALLOUT_KINDS
+    ]
+    blocking_windows.sort()
+    kept: List[Dict[str, Any]] = []
+    for overlay in plan.overlays:
+        if str(overlay.get("kind") or "") not in AVATAR_CALLOUT_KINDS:
+            kept.append(overlay)
+            continue
+        start = float(overlay.get("time") or 0)
+        length = float(overlay.get("duration") or 0)
+        for lo, hi in blocking_windows:
+            if start < hi and start + length > lo:
+                if start < lo - 2.0:
+                    length = lo - 0.3 - start
+                elif hi + 2.2 < duration - 1.0:
+                    start = hi + 0.3
+                else:
+                    length = 0
+                break
+        clear = length >= 1.8 and not any(start < hi and start + length > lo for lo, hi in blocking_windows)
+        if clear:
+            overlay["time"] = round(start, 2)
+            overlay["duration"] = round(length, 2)
+            kept.append(overlay)
+    plan.overlays = kept
+
+    for index, image in enumerate(plan.images, start=1):
+        image.index = index
+    return plan
+
+
 def enhance_director_plan(
     plan: DirectorPlan,
     title: str,
@@ -1180,6 +1481,8 @@ def enhance_director_plan(
     image_target: int,
     keep_existing_overlays: bool = True,
     transcript_chunks: Optional[List[TranscriptChunk]] = None,
+    transcript_words: Optional[List[TranscriptWord]] = None,
+    log: Any = None,
 ) -> DirectorPlan:
     plan.images = normalize_images(
         plan.images,
@@ -1210,6 +1513,9 @@ def enhance_director_plan(
         derived = remove_conflicting_progressive_cards(derived, progressive) + progressive
         derived = prioritize_data_viz(derived, stats) + stats
         plan.overlays = sanitize_overlays(opening + derived, plan.images, duration)
+    words = transcript_words or (words_from_chunks(transcript_chunks) if transcript_chunks else [])
+    if words:
+        plan = sync_plan_to_speech(plan, words, duration, log=log)
     return plan
 
 
@@ -2746,9 +3052,9 @@ class AvatarTaxApp:
         saved_provider = str(self.settings.get("planning_provider") or "derouter_gpt")
         self.planning_provider = tk.StringVar(value=PLANNING_PROVIDER_LABELS.get(saved_provider, "Derouter GPT"))
         self.model_name = tk.StringVar(value=str(self.settings.get("model_name") or default_model(saved_provider)))
-        saved_transcription = str(self.settings.get("transcription_provider") or "local_mac")
+        saved_transcription = str(self.settings.get("transcription_provider") or "local_whisperx")
         self.transcription_provider = tk.StringVar(
-            value=TRANSCRIPTION_PROVIDER_LABELS.get(saved_transcription, "Local Mac (faster-whisper)")
+            value=TRANSCRIPTION_PROVIDER_LABELS.get(saved_transcription, "Local WhisperX (word-level sync)")
         )
         self.image_policy = tk.StringVar(value="Auto: about 1-2 useful inserts/min")
         self.avatars_label = tk.StringVar(value=str(self.avatars_dir))
@@ -2976,6 +3282,7 @@ class AvatarTaxApp:
 
         transcript = ""
         transcript_chunks: List[TranscriptChunk] = []
+        transcript_words: List[TranscriptWord] = []
         provider = transcription_key(self.transcription_provider.get())
         audio_path = work_dir / "voice.wav"
         if provider != "none":
@@ -2985,8 +3292,10 @@ class AvatarTaxApp:
                 transcript_result = self.transcribe_with_recovery(audio_path, provider)
                 transcript = transcript_result.text
                 transcript_chunks = transcript_result.chunks
+                transcript_words = transcript_result.words
                 (work_dir / "transcript.txt").write_text(transcript, encoding="utf-8")
-                self.log(f"{video.name}: transcript ready ({len(transcript.split())} words).")
+                sync_note = f", {len(transcript_words)} timed words" if transcript_words else ""
+                self.log(f"{video.name}: transcript ready ({len(transcript.split())} words{sync_note}).")
             except Exception as exc:
                 self.log(f"{video.name}: transcription failed, continuing with local timing: {exc}")
         else:
@@ -3028,6 +3337,8 @@ class AvatarTaxApp:
             image_target,
             keep_existing_overlays=keep_existing_overlays,
             transcript_chunks=transcript_chunks,
+            transcript_words=transcript_words,
+            log=self.log,
         )
         plan.title = display_title_from_transcript(plan.title, transcript, video.stem)
         if plan.images:
@@ -3050,6 +3361,12 @@ class AvatarTaxApp:
     def transcribe_with_recovery(self, audio: Path, provider: str) -> TranscriptResult:
         while True:
             try:
+                if provider == "local_whisperx":
+                    try:
+                        return transcribe_whisperx(audio, self.log)
+                    except Exception as exc:
+                        self.log(f"WhisperX unavailable ({brief_error(exc, 180)}); falling back to faster-whisper.")
+                        return transcribe_local(audio, self.log)
                 if provider == "local_mac":
                     return transcribe_local(audio, self.log)
                 return transcribe_openai(audio, self.log)

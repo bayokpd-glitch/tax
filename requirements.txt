@@ -3,3 +3,5 @@ python-dotenv
 pillow
 openai
 faster-whisper
+# Optional but recommended: word-level timestamps for tight overlay sync
+whisperx
