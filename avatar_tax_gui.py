@@ -2482,21 +2482,99 @@ Rules:
 - Times must be within duration.
 """
     log(f"Planning edit with {PLANNING_PROVIDER_LABELS.get(provider, provider)} ({model})...")
-    response = client.chat.completions.create(
+    content = chat_completion_text(
+        client,
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.45,
+        log=log,
     )
-    data = parse_json_object(response.choices[0].message.content or "")
+    data = parse_json_object(content)
     return normalize_plan(data, title=title, duration=duration)
 
 
+TRANSIENT_API_MARKERS = (
+    "524",
+    "522",
+    "502",
+    "503",
+    "504",
+    "timeout",
+    "timed out",
+    "retryable",
+    "overloaded",
+    "too many requests",
+    "429",
+    "connection error",
+    "connection reset",
+    "remote protocol",
+    "incomplete",
+)
+
+
+def transient_api_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in TRANSIENT_API_MARKERS)
+
+
+def chat_completion_text(
+    client: Any,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    log: Any,
+    attempts: int = 3,
+) -> str:
+    """Stream the completion so proxies never see a silent 120s window
+    (Cloudflare 524), and auto-retry transient failures with backoff."""
+    delay = 15.0
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            try:
+                stream = client.chat.completions.create(
+                    model=model, messages=messages, temperature=temperature, stream=True
+                )
+                parts: List[str] = []
+                for chunk in stream:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    delta = chunk.choices[0].delta
+                    piece = getattr(delta, "content", None) if delta is not None else None
+                    if piece:
+                        parts.append(piece)
+                text = "".join(parts)
+            except Exception as stream_exc:
+                # Some OpenAI-compatible gateways reject stream=True; try once plain.
+                if "stream" not in str(stream_exc).lower():
+                    raise
+                response = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+                text = response.choices[0].message.content or ""
+            if text.strip():
+                return text
+            raise RuntimeError("Model returned an empty response.")
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts and transient_api_error(exc):
+                log(
+                    f"Planning request stalled (attempt {attempt}/{attempts}): "
+                    f"{brief_error(exc, 140)} Retrying in {delay:.0f}s..."
+                )
+                time.sleep(delay)
+                delay = min(delay * 2.5, 120.0)
+                continue
+            raise
+    raise last_exc if last_exc else RuntimeError("Planning request failed.")
+
+
 def planning_batch_count(duration: float) -> int:
-    if duration < 7 * 60:
+    # Smaller windows keep each request fast enough to stay well under
+    # gateway timeouts (Cloudflare cuts silent responses at 120s).
+    if duration < 5 * 60:
         return 1
-    if duration < 12 * 60:
+    if duration < 9 * 60:
         return 2
-    return min(6, max(3, math.ceil(duration / (5 * 60))))
+    return min(8, max(3, math.ceil(duration / (4 * 60))))
 
 
 def split_transcript_batches(
