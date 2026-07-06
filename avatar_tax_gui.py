@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -16,6 +17,32 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+
+def relaunch_inside_local_venv() -> None:
+    if os.environ.get("AVATAR_TAX_NO_VENV_REEXEC") == "1":
+        return
+
+    app_root = Path(__file__).resolve().parent
+    venv_python = app_root / ".venv" / "Scripts" / "python.exe"
+    if not venv_python.exists():
+        return
+
+    try:
+        current_python = Path(sys.executable).resolve()
+        target_python = venv_python.resolve()
+    except OSError:
+        current_python = Path(sys.executable)
+        target_python = venv_python
+
+    if current_python == target_python:
+        return
+
+    os.environ["AVATAR_TAX_NO_VENV_REEXEC"] = "1"
+    os.execv(str(venv_python), [str(venv_python), str(app_root / Path(__file__).name), *sys.argv[1:]])
+
+
+relaunch_inside_local_venv()
 
 import requests
 import tkinter as tk
@@ -41,6 +68,7 @@ APP_TITLE = "Avatar Tax"
 SETTINGS_FILE = ".avatar_tax_settings.json"
 SERPER_ENDPOINT = "https://google.serper.dev/images"
 DEROUTER_BASE_URL = "https://api.derouter.ai/openai/v1"
+DLL_DIRECTORY_HANDLES: Dict[str, Any] = {}
 
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
@@ -56,8 +84,8 @@ PLANNING_PROVIDER_LABELS = {
 }
 
 TRANSCRIPTION_PROVIDER_LABELS = {
-    "local_whisperx": "Local WhisperX (word-level sync)",
-    "local_mac": "Local faster-whisper",
+    "local_mac": "Local fast (word-level sync)",
+    "local_whisperx": "Local WhisperX (most accurate, slower)",
     "openai_mini": "OpenAI gpt-4o-mini-transcribe",
     "none": "No transcription",
 }
@@ -469,6 +497,9 @@ def transcript_chunks_for_prompt(chunks: List[TranscriptChunk], duration: float)
     return "\n".join(lines[:260])
 
 
+_FASTER_WHISPER_CACHE: Dict[str, Any] = {}
+
+
 def transcribe_local(audio: Path, log: Any) -> TranscriptResult:
     try:
         from faster_whisper import WhisperModel
@@ -478,9 +509,25 @@ def transcribe_local(audio: Path, log: Any) -> TranscriptResult:
     model_name = os.getenv("WHISPER_MODEL", "base")
     device = os.getenv("WHISPER_DEVICE", "cpu")
     compute_type = os.getenv("WHISPER_COMPUTE", "int8")
+    cache_key = f"{model_name}|{device}|{compute_type}"
+    model = _FASTER_WHISPER_CACHE.get(cache_key)
+    if model is None:
+        log(f"Loading faster-whisper model ({model_name})...")
+        model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=max(4, os.cpu_count() or 4),
+        )
+        _FASTER_WHISPER_CACHE[cache_key] = model
     log(f"Transcribing locally with faster-whisper ({model_name})...")
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    segments, _info = model.transcribe(str(audio), vad_filter=True, word_timestamps=True)
+    segments, _info = model.transcribe(
+        str(audio),
+        vad_filter=True,
+        word_timestamps=True,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
     chunks: List[TranscriptChunk] = []
     words: List[TranscriptWord] = []
     parts: List[str] = []
@@ -498,33 +545,45 @@ def transcribe_local(audio: Path, log: Any) -> TranscriptResult:
 
 
 def transcribe_whisperx(audio: Path, log: Any) -> TranscriptResult:
-    try:
-        import whisperx
-    except Exception as exc:
-        raise RuntimeError("whisperx is not installed. Install it with: pip install whisperx") from exc
+    """Run WhisperX in an isolated child process. A crash, hang, or OOM in
+    torch/ctranslate2 kills only the child; the GUI keeps running and the
+    caller falls back to faster-whisper."""
+    app_root = Path(__file__).resolve().parent
+    runner = app_root / "whisperx_runner.py"
+    if not runner.exists():
+        raise RuntimeError("whisperx_runner.py is missing next to the app.")
 
-    device = os.getenv("WHISPER_DEVICE", "cpu")
-    compute_type = os.getenv("WHISPER_COMPUTE", "int8")
     model_name = os.getenv("WHISPERX_MODEL", os.getenv("WHISPER_MODEL", "base"))
-    batch_size = int(os.getenv("WHISPERX_BATCH", "8"))
-    log(f"Transcribing with WhisperX ({model_name})...")
-    model = whisperx.load_model(model_name, device, compute_type=compute_type)
-    audio_data = whisperx.load_audio(str(audio))
-    result = model.transcribe(audio_data, batch_size=batch_size)
-    language = str(result.get("language") or "en")
-    try:
-        align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
-        result = whisperx.align(
-            result["segments"], align_model, metadata, audio_data, device, return_char_alignments=False
-        )
-        log("WhisperX word-level alignment complete.")
-    except Exception as exc:
-        log(f"WhisperX alignment unavailable, keeping segment timing: {brief_error(exc, 200)}")
+    timeout_seconds = int(os.getenv("WHISPERX_TIMEOUT", "1800"))
+    out_json = audio.with_suffix(".whisperx.json")
+    out_json.unlink(missing_ok=True)
 
+    log(f"Transcribing with WhisperX ({model_name}) in an isolated process...")
+    kwargs: Dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(runner), str(audio), str(out_json)],
+            cwd=app_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_seconds,
+            **kwargs,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"WhisperX timed out after {timeout_seconds}s.") from exc
+    if proc.returncode != 0 or not out_json.exists():
+        tail = clean_text(proc.stdout or "")[-500:]
+        raise RuntimeError(f"WhisperX process failed (code {proc.returncode}). {tail}")
+
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    out_json.unlink(missing_ok=True)
     chunks: List[TranscriptChunk] = []
     words: List[TranscriptWord] = []
     parts: List[str] = []
-    for segment in result.get("segments") or []:
+    for segment in data.get("segments") or []:
         text = clean_text(str(segment.get("text") or ""))
         if not text:
             continue
@@ -533,11 +592,13 @@ def transcribe_whisperx(audio: Path, log: Any) -> TranscriptResult:
             TranscriptChunk(round(float(segment.get("start") or 0), 2), round(float(segment.get("end") or 0), 2), text)
         )
         for word in segment.get("words") or []:
-            if word.get("start") is None or word.get("end") is None:
-                continue
             token = clean_text(str(word.get("word") or ""))
             if token:
                 words.append(TranscriptWord(round(float(word["start"]), 2), round(float(word["end"]), 2), token))
+    if words:
+        log(f"WhisperX word-level alignment complete ({len(words)} timed words).")
+    else:
+        log("WhisperX finished with segment timing only.")
     return TranscriptResult(clean_text(" ".join(parts)), chunks, words)
 
 
@@ -3052,9 +3113,9 @@ class AvatarTaxApp:
         saved_provider = str(self.settings.get("planning_provider") or "derouter_gpt")
         self.planning_provider = tk.StringVar(value=PLANNING_PROVIDER_LABELS.get(saved_provider, "Derouter GPT"))
         self.model_name = tk.StringVar(value=str(self.settings.get("model_name") or default_model(saved_provider)))
-        saved_transcription = str(self.settings.get("transcription_provider") or "local_whisperx")
+        saved_transcription = str(self.settings.get("transcription_provider") or "local_mac")
         self.transcription_provider = tk.StringVar(
-            value=TRANSCRIPTION_PROVIDER_LABELS.get(saved_transcription, "Local WhisperX (word-level sync)")
+            value=TRANSCRIPTION_PROVIDER_LABELS.get(saved_transcription, "Local fast (word-level sync)")
         )
         self.image_policy = tk.StringVar(value="Auto: about 1-2 useful inserts/min")
         self.avatars_label = tk.StringVar(value=str(self.avatars_dir))
@@ -3365,7 +3426,11 @@ class AvatarTaxApp:
                     try:
                         return transcribe_whisperx(audio, self.log)
                     except Exception as exc:
-                        self.log(f"WhisperX unavailable ({brief_error(exc, 180)}); falling back to faster-whisper.")
+                        self.log(
+                            "WhisperX unavailable "
+                            f"({brief_error(exc, 180)}; python={sys.executable}); "
+                            "falling back to faster-whisper."
+                        )
                         return transcribe_local(audio, self.log)
                 if provider == "local_mac":
                     return transcribe_local(audio, self.log)
