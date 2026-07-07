@@ -3067,74 +3067,6 @@ def blocked_image_domain(domain_or_source: str) -> bool:
     return any(blocked in value for blocked in BLOCKED_IMAGE_DOMAINS)
 
 
-_GEMINI_CLIENT: Any = None
-_GEMINI_TRIED = False
-
-
-def gemini_client_or_none() -> Any:
-    global _GEMINI_CLIENT, _GEMINI_TRIED
-    if _GEMINI_TRIED:
-        return _GEMINI_CLIENT
-    _GEMINI_TRIED = True
-    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY") or "").strip()
-    if not key:
-        return None
-    try:
-        from google import genai
-
-        _GEMINI_CLIENT = genai.Client(api_key=key)
-    except Exception:
-        _GEMINI_CLIENT = None
-    return _GEMINI_CLIENT
-
-
-def vision_pick_image_choice(caption: str, query: str, choices: List[Dict[str, Any]]) -> Optional[int]:
-    """Ask Gemini which downloaded candidate genuinely fits the moment.
-    Returns the index of the best candidate, None when all are rejected,
-    or -1 when vision is unavailable (caller keeps the heuristic pick)."""
-    client = gemini_client_or_none()
-    if client is None:
-        return -1
-    from google.genai import types as genai_types
-
-    candidates = [choice for choice in choices if Path(str(choice.get("path") or "")).exists()][:4]
-    if not candidates:
-        return -1
-    valid = ", ".join(str(i + 1) for i in range(len(candidates)))
-    prompt = (
-        f"MOMENT FROM A TAX/RETIREMENT EXPLAINER VIDEO:\n\"{caption or query}\"\n"
-        f"Search query used: \"{query}\"\n\n"
-        f"Which candidate photo best fits this moment as clean editorial B-roll?\n"
-        f"Reply with exactly one of: {valid}, or NONE. No explanation.\n\n"
-        f"REJECT any image that looks like a YouTube thumbnail (play buttons, big "
-        f"overlaid text, glowing outlines, reaction faces), a logo, a cartoon or "
-        f"illustration, a meme, a screenshot of a website, or watermarked stock. "
-        f"Prefer real documentary-style photos of people, documents, or places."
-    )
-    parts = [genai_types.Part(text=prompt)]
-    for choice in candidates:
-        path = Path(str(choice["path"]))
-        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-        parts.append(genai_types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
-    try:
-        response = client.models.generate_content(
-            model=os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash"),
-            contents=parts,
-            config=genai_types.GenerateContentConfig(temperature=0.0, max_output_tokens=10),
-        )
-        raw = (response.text or "").strip().upper()
-    except Exception:
-        return -1
-    if "NONE" in raw:
-        return None
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if digits:
-        index = int(digits) - 1
-        if 0 <= index < len(candidates):
-            return choices.index(candidates[index])
-    return None
-
-
 def download_good_image_choices(
     items: List[Dict[str, Any]],
     dest: Path,
@@ -3766,34 +3698,17 @@ class AvatarTaxApp:
         for image in plan.images:
             try:
                 choices: List[Dict[str, Any]] = []
-                unverified: List[Dict[str, Any]] = []
                 attempts = image_query_attempts(image.query, image.caption, fallback_pool, image.index)
                 for attempt_no, attempt_query in enumerate(attempts, start=1):
                     items = self.search_serper_with_recovery(attempt_query, limit=14)
-                    candidates = download_good_image_choices(
+                    choices = download_good_image_choices(
                         items, assets_dir, image.index, used_urls=used_urls, tag=f"a{attempt_no}_"
                     )
-                    if not candidates:
-                        continue
-                    pick = vision_pick_image_choice(image.caption, attempt_query, candidates)
-                    if pick is None:
-                        if not unverified:
-                            unverified = candidates
-                        self.log(
-                            f"Image {image.index}: vision rejected {len(candidates)} candidate(s) "
-                            f"for '{attempt_query[:44]}', trying another query..."
-                        )
-                        continue
-                    if pick >= 0:
-                        candidates.insert(0, candidates.pop(pick))
-                    choices = candidates
-                    if attempt_query != image.query:
-                        self.log(f"Image {image.index}: retried with simpler query: {attempt_query}")
-                        image.query = attempt_query
-                    break
-                if not choices and unverified:
-                    choices = unverified
-                    self.log(f"Image {image.index}: vision approved none; keeping best heuristic match.")
+                    if choices:
+                        if attempt_query != image.query:
+                            self.log(f"Image {image.index}: retried with simpler query: {attempt_query}")
+                            image.query = attempt_query
+                        break
                 if not choices:
                     image.use = False
                     self.log(f"Image {image.index}: no usable image for {image.query}")
