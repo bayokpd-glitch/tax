@@ -8,6 +8,7 @@ WHISPER_COMPUTE, WHISPERX_BATCH, WHISPERX_VAD, WHISPERX_MODEL_DIR.
 Writes {"language", "segments": [{"start", "end", "text", "words": [...]}]}.
 """
 
+import faulthandler
 import json
 import os
 import sys
@@ -18,6 +19,15 @@ APP_ROOT = Path(__file__).resolve().parent
 
 
 def prepare_environment() -> None:
+    # Torch-on-Windows stability: cap duplicate OpenMP runtimes and dump
+    # native tracebacks to a log instead of dying silently.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    try:
+        faulthandler.enable(open(APP_ROOT / "work" / "whisperx_native_crash.log", "a", encoding="utf-8"), all_threads=True)
+    except Exception:
+        pass
     av_libs = APP_ROOT / ".venv" / "Lib" / "site-packages" / "av.libs"
     if hasattr(os, "add_dll_directory") and av_libs.exists():
         try:
@@ -34,16 +44,28 @@ def prepare_environment() -> None:
     )
 
 
+def pick_device() -> str:
+    override = os.getenv("WHISPER_DEVICE", "").strip().lower()
+    if override:
+        return override
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def main() -> int:
     audio_path, out_path = sys.argv[1:3]
     prepare_environment()
 
     import whisperx
 
-    device = os.getenv("WHISPER_DEVICE", "cpu")
-    compute_type = os.getenv("WHISPER_COMPUTE", "int8")
+    device = pick_device()
+    compute_type = os.getenv("WHISPER_COMPUTE", "").strip() or ("float16" if device == "cuda" else "int8")
     model_name = os.getenv("WHISPERX_MODEL", os.getenv("WHISPER_MODEL", "base"))
-    batch_size = max(1, int(os.getenv("WHISPERX_BATCH", "4")))
+    batch_size = max(1, int(os.getenv("WHISPERX_BATCH", "16" if device == "cuda" else "4")))
     vad_method = os.getenv("WHISPERX_VAD", os.getenv("WHISPERX_VAD_METHOD", "silero"))
     model_dir = Path(os.getenv("WHISPERX_MODEL_DIR", str(APP_ROOT / "work" / "whisperx_models")))
     if not model_dir.is_absolute():

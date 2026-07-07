@@ -5,3 +5,5 @@ openai
 faster-whisper
 # Optional but recommended: word-level timestamps for tight overlay sync
 whisperx
+# Optional: Gemini vision check of downloaded B-roll images (needs GEMINI_API_KEY)
+google-genai

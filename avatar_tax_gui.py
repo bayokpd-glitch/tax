@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import difflib
 import json
 import math
 import mimetypes
@@ -1364,6 +1365,44 @@ def sync_token_weight(token: str) -> int:
     return 1
 
 
+def sync_token_list(*texts: Any) -> List[str]:
+    """Ordered normalized tokens (unlike sync_tokens, which is a set)."""
+    tokens: List[str] = []
+    for text in texts:
+        tokens.extend(
+            SYNC_TOKEN_RE.findall(str(text or "").lower().replace(",", "").replace("$", " ").replace("%", " "))
+        )
+    return tokens
+
+
+def find_cue_anchor(
+    words: List[TranscriptWord],
+    word_tokens: List[str],
+    timepoint: float,
+    cue_tokens: List[str],
+    window_before: float = 25.0,
+    window_after: float = 35.0,
+) -> Optional[int]:
+    """Sequence-align the verbatim cue against the transcript words (the
+    align_scenes technique from the news pipeline): the longest in-order token
+    run pins the visual to the exact word index where the cue is spoken."""
+    if not cue_tokens:
+        return None
+    window = [
+        (index, token)
+        for index, token in enumerate(word_tokens)
+        if token and timepoint - window_before <= words[index].start <= timepoint + window_after
+    ]
+    if not window:
+        return None
+    haystack = [token for _, token in window]
+    matcher = difflib.SequenceMatcher(a=cue_tokens, b=haystack, autojunk=False)
+    match = matcher.find_longest_match(0, len(cue_tokens), 0, len(haystack))
+    if match.size >= 2 or (match.size == 1 and cue_tokens[match.a].isdigit()):
+        return window[match.b][0]
+    return None
+
+
 def find_speech_anchor(
     spans: List[SpeechSpan],
     timepoint: float,
@@ -1431,19 +1470,39 @@ def sync_plan_to_speech(plan: DirectorPlan, words: List[TranscriptWord], duratio
     spans = speech_sentence_spans(words)
     if not spans:
         return plan
+    word_tokens = [(sync_token_list(word.text) or [""])[0] for word in words]
+
+    def span_index_at(timestamp: float) -> Optional[int]:
+        for index, span in enumerate(spans):
+            if span.start - 0.3 <= timestamp <= span.end + 0.3:
+                return index
+        return None
+
+    def resolve_anchor(timepoint: float, cue: str, *fallback_texts: Any) -> Optional[Tuple[int, float]]:
+        # Verbatim cue sequence match first (exact word), then weighted fuzzy.
+        for source in (cue, " ".join(str(t or "") for t in fallback_texts)):
+            cue_tokens = sync_token_list(source)
+            word_index = find_cue_anchor(words, word_tokens, timepoint, cue_tokens) if cue_tokens else None
+            if word_index is not None:
+                anchor = words[word_index].start
+                span_idx = span_index_at(anchor)
+                if span_idx is not None:
+                    return span_idx, anchor
+        tokens = sync_tokens(cue, *fallback_texts)
+        return find_speech_anchor(spans, timepoint, tokens)
 
     synced = 0
     unmatched = 0
     for overlay in plan.overlays:
         kind = str(overlay.get("kind") or "")
         timepoint = float(overlay.get("time") or 0)
-        tokens = sync_tokens(
-            overlay.get("cue"),
+        hit = resolve_anchor(
+            timepoint,
+            str(overlay.get("cue") or ""),
             overlay.get("text"),
             overlay.get("value"),
             " ".join(str(item) for item in (overlay.get("items") or [])),
         )
-        hit = find_speech_anchor(spans, timepoint, tokens)
         if hit is None:
             unmatched += 1
             continue
@@ -1463,8 +1522,7 @@ def sync_plan_to_speech(plan: DirectorPlan, words: List[TranscriptWord], duratio
         synced += 1
 
     for image in plan.images:
-        tokens = sync_tokens(image.cue, image.caption, image.query)
-        hit = find_speech_anchor(spans, image.time, tokens, window_before=8.0, window_after=16.0)
+        hit = resolve_anchor(image.time, image.cue, image.caption, image.query)
         if hit is None:
             unmatched += 1
             continue
@@ -2932,17 +2990,52 @@ def inspect_avatar_image_file(path: Path) -> tuple[bool, int, List[str]]:
         return False, 0, [f"invalid image: {exc}"]
 
 
+_SERPER_KEY_INDEX = 0
+_SERPER_KEY_LOCK = threading.Lock()
+
+
+def load_serper_keys() -> List[str]:
+    """Supports multiple keys: SERPER_API_KEYS=key1,key2,... (or the single
+    SERPER_API_KEY). Rotates automatically when one runs out of quota."""
+    raw = os.getenv("SERPER_API_KEYS") or os.getenv("SERPER_API_KEY") or ""
+    keys: List[str] = []
+    for key in re.split(r"[,;\s]+", raw):
+        key = key.strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
 def search_serper_images(query: str, limit: int = 8) -> List[Dict[str, Any]]:
-    key = os.getenv("SERPER_API_KEY", "").strip()
-    if not key:
+    global _SERPER_KEY_INDEX
+    keys = load_serper_keys()
+    if not keys:
         raise RuntimeError("SERPER_API_KEY is missing.")
-    response = requests.post(
-        SERPER_ENDPOINT,
-        headers={"X-API-KEY": key, "Content-Type": "application/json"},
-        json={"q": clean_image_query(query), "num": limit, "tbs": "itp:photo"},
-        timeout=35,
-    )
-    response.raise_for_status()
+    response = None
+    last_error: Optional[Exception] = None
+    for _attempt in range(len(keys)):
+        with _SERPER_KEY_LOCK:
+            key = keys[_SERPER_KEY_INDEX % len(keys)]
+        try:
+            response = requests.post(
+                SERPER_ENDPOINT,
+                headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                json={"q": clean_image_query(query), "num": limit, "tbs": "itp:photo"},
+                timeout=35,
+            )
+            response.raise_for_status()
+            break
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status in {401, 402, 403, 429} and len(keys) > 1:
+                with _SERPER_KEY_LOCK:
+                    _SERPER_KEY_INDEX = (_SERPER_KEY_INDEX + 1) % len(keys)
+                last_error = exc
+                response = None
+                continue
+            raise
+    if response is None:
+        raise last_error if last_error else RuntimeError("All Serper keys failed.")
     items = list((response.json() or {}).get("images") or [])
     filtered: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -2974,12 +3067,81 @@ def blocked_image_domain(domain_or_source: str) -> bool:
     return any(blocked in value for blocked in BLOCKED_IMAGE_DOMAINS)
 
 
+_GEMINI_CLIENT: Any = None
+_GEMINI_TRIED = False
+
+
+def gemini_client_or_none() -> Any:
+    global _GEMINI_CLIENT, _GEMINI_TRIED
+    if _GEMINI_TRIED:
+        return _GEMINI_CLIENT
+    _GEMINI_TRIED = True
+    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY") or "").strip()
+    if not key:
+        return None
+    try:
+        from google import genai
+
+        _GEMINI_CLIENT = genai.Client(api_key=key)
+    except Exception:
+        _GEMINI_CLIENT = None
+    return _GEMINI_CLIENT
+
+
+def vision_pick_image_choice(caption: str, query: str, choices: List[Dict[str, Any]]) -> Optional[int]:
+    """Ask Gemini which downloaded candidate genuinely fits the moment.
+    Returns the index of the best candidate, None when all are rejected,
+    or -1 when vision is unavailable (caller keeps the heuristic pick)."""
+    client = gemini_client_or_none()
+    if client is None:
+        return -1
+    from google.genai import types as genai_types
+
+    candidates = [choice for choice in choices if Path(str(choice.get("path") or "")).exists()][:4]
+    if not candidates:
+        return -1
+    valid = ", ".join(str(i + 1) for i in range(len(candidates)))
+    prompt = (
+        f"MOMENT FROM A TAX/RETIREMENT EXPLAINER VIDEO:\n\"{caption or query}\"\n"
+        f"Search query used: \"{query}\"\n\n"
+        f"Which candidate photo best fits this moment as clean editorial B-roll?\n"
+        f"Reply with exactly one of: {valid}, or NONE. No explanation.\n\n"
+        f"REJECT any image that looks like a YouTube thumbnail (play buttons, big "
+        f"overlaid text, glowing outlines, reaction faces), a logo, a cartoon or "
+        f"illustration, a meme, a screenshot of a website, or watermarked stock. "
+        f"Prefer real documentary-style photos of people, documents, or places."
+    )
+    parts = [genai_types.Part(text=prompt)]
+    for choice in candidates:
+        path = Path(str(choice["path"]))
+        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        parts.append(genai_types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
+    try:
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash"),
+            contents=parts,
+            config=genai_types.GenerateContentConfig(temperature=0.0, max_output_tokens=10),
+        )
+        raw = (response.text or "").strip().upper()
+    except Exception:
+        return -1
+    if "NONE" in raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits:
+        index = int(digits) - 1
+        if 0 <= index < len(candidates):
+            return choices.index(candidates[index])
+    return None
+
+
 def download_good_image_choices(
     items: List[Dict[str, Any]],
     dest: Path,
     index: int,
     limit: int = IMAGE_CHOICE_COUNT,
     used_urls: Optional[set[str]] = None,
+    tag: str = "",
 ) -> List[Dict[str, Any]]:
     dest.mkdir(parents=True, exist_ok=True)
     choices: List[Dict[str, Any]] = []
@@ -3010,7 +3172,7 @@ def download_good_image_choices(
             if "image" not in content_type.lower():
                 continue
             ext = extension_for_image(url, content_type)
-            path = dest / f"insert_{index:02d}_{len(choices) + 1}{ext}"
+            path = dest / f"insert_{index:02d}_{tag}{len(choices) + 1}{ext}"
             path.write_bytes(res.content)
             if path.stat().st_size < 3000:
                 path.unlink(missing_ok=True)
@@ -3604,14 +3766,34 @@ class AvatarTaxApp:
         for image in plan.images:
             try:
                 choices: List[Dict[str, Any]] = []
-                for attempt_query in image_query_attempts(image.query, image.caption, fallback_pool, image.index):
+                unverified: List[Dict[str, Any]] = []
+                attempts = image_query_attempts(image.query, image.caption, fallback_pool, image.index)
+                for attempt_no, attempt_query in enumerate(attempts, start=1):
                     items = self.search_serper_with_recovery(attempt_query, limit=14)
-                    choices = download_good_image_choices(items, assets_dir, image.index, used_urls=used_urls)
-                    if choices:
-                        if attempt_query != image.query:
-                            self.log(f"Image {image.index}: retried with simpler query: {attempt_query}")
-                            image.query = attempt_query
-                        break
+                    candidates = download_good_image_choices(
+                        items, assets_dir, image.index, used_urls=used_urls, tag=f"a{attempt_no}_"
+                    )
+                    if not candidates:
+                        continue
+                    pick = vision_pick_image_choice(image.caption, attempt_query, candidates)
+                    if pick is None:
+                        if not unverified:
+                            unverified = candidates
+                        self.log(
+                            f"Image {image.index}: vision rejected {len(candidates)} candidate(s) "
+                            f"for '{attempt_query[:44]}', trying another query..."
+                        )
+                        continue
+                    if pick >= 0:
+                        candidates.insert(0, candidates.pop(pick))
+                    choices = candidates
+                    if attempt_query != image.query:
+                        self.log(f"Image {image.index}: retried with simpler query: {attempt_query}")
+                        image.query = attempt_query
+                    break
+                if not choices and unverified:
+                    choices = unverified
+                    self.log(f"Image {image.index}: vision approved none; keeping best heuristic match.")
                 if not choices:
                     image.use = False
                     self.log(f"Image {image.index}: no usable image for {image.query}")
