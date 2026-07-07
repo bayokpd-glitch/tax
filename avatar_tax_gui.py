@@ -182,6 +182,7 @@ class PlannedImage:
     duration: float
     query: str
     caption: str
+    cue: str = ""
     path: str = ""
     source: str = ""
     use: bool = True
@@ -208,6 +209,7 @@ class SpeechSpan:
     start: float
     end: float
     text: str
+    words: List["TranscriptWord"] = field(default_factory=list)
 
 
 @dataclass
@@ -706,6 +708,7 @@ def local_plan(title: str, transcript: str, duration: float, image_target: Optio
                 duration=4.2,
                 query=clean_image_query(image_seed),
                 caption=phrase,
+                cue=clean_text(image_seed)[:140],
             )
         )
 
@@ -1322,18 +1325,22 @@ def speech_sentence_spans(words: List[TranscriptWord], max_span_seconds: float =
     exact time a point is being made."""
     spans: List[SpeechSpan] = []
     bucket: List[TranscriptWord] = []
+
+    def flush(end: float) -> None:
+        if bucket:
+            spans.append(SpeechSpan(bucket[0].start, end, " ".join(w.text for w in bucket), list(bucket)))
+
     for word in words:
         if bucket and word.start - bucket[-1].end > 1.6:
-            spans.append(SpeechSpan(bucket[0].start, bucket[-1].end, " ".join(w.text for w in bucket)))
+            flush(bucket[-1].end)
             bucket = []
         bucket.append(word)
         ends_sentence = bool(re.search(r"[.!?]$", word.text))
         too_long = word.end - bucket[0].start >= max_span_seconds
         if ends_sentence or too_long:
-            spans.append(SpeechSpan(bucket[0].start, word.end, " ".join(w.text for w in bucket)))
+            flush(word.end)
             bucket = []
-    if bucket:
-        spans.append(SpeechSpan(bucket[0].start, bucket[-1].end, " ".join(w.text for w in bucket)))
+    flush(bucket[-1].end if bucket else 0.0)
     return [span for span in spans if span.end > span.start]
 
 
@@ -1349,38 +1356,47 @@ def sync_tokens(*texts: Any) -> set[str]:
     return tokens
 
 
-def best_span_for_event(
+def sync_token_weight(token: str) -> int:
+    if token.isdigit():
+        return 3
+    if len(token) >= 6:
+        return 2
+    return 1
+
+
+def find_speech_anchor(
     spans: List[SpeechSpan],
     timepoint: float,
     tokens: set[str],
-    window_before: float = 8.0,
-    window_after: float = 14.0,
-) -> Optional[SpeechSpan]:
-    """Find the spoken sentence this visual belongs to: token overlap first,
-    proximity to the planned time as tiebreaker."""
-    best: Optional[SpeechSpan] = None
-    best_score = 0.0
-    for span in spans:
+    window_before: float = 12.0,
+    window_after: float = 20.0,
+) -> Optional[Tuple[int, float]]:
+    """Find the spoken sentence this visual belongs to and the exact moment
+    its first matching word is said. Weighted tokens (numbers > long words >
+    short words) with a confidence threshold: a vague 1-word overlap far from
+    the planned time is treated as no match, so we never confidently place a
+    visual on the wrong sentence."""
+    best: Optional[Tuple[int, float]] = None
+    best_key = (0.0, float("inf"))
+    for index, span in enumerate(spans):
         if span.end < timepoint - window_before or span.start > timepoint + window_after:
             continue
-        span_tokens = sync_tokens(span.text)
-        overlap = len(tokens & span_tokens)
-        if not overlap:
+        matched = tokens & sync_tokens(span.text)
+        if not matched:
             continue
-        digit_hits = sum(1 for token in tokens & span_tokens if token.isdigit())
+        score = sum(sync_token_weight(token) for token in matched)
         distance = abs(span.start - timepoint)
-        score = overlap + digit_hits * 2 - distance * 0.05
-        if score > best_score:
-            best_score = score
-            best = span
+        if score < 3 and not (score >= 2 and distance <= 7.0):
+            continue
+        if (score, -distance) > (best_key[0], -best_key[1]):
+            anchor = span.start
+            for word in span.words:
+                if tokens & sync_tokens(word.text):
+                    anchor = word.start
+                    break
+            best = (index, anchor)
+            best_key = (score, distance)
     return best
-
-
-def span_containing(spans: List[SpeechSpan], timepoint: float) -> Optional[SpeechSpan]:
-    for span in spans:
-        if span.start - 0.3 <= timepoint <= span.end + 0.3:
-            return span
-    return None
 
 
 def sync_duration_bounds(kind: str, progressive: bool) -> Tuple[float, float]:
@@ -1391,62 +1407,79 @@ def sync_duration_bounds(kind: str, progressive: bool) -> Tuple[float, float]:
     if progressive:
         return (2.6, 6.0)
     if kind in DATA_VIZ_KINDS:
-        return (3.0, 10.0)
-    return (3.0, 12.0)
+        return (3.0, 9.0)
+    return (3.0, 9.0)
+
+
+def speech_hold_end(spans: List[SpeechSpan], index: int, anchor: float) -> float:
+    """Hold until the sentence finishes; if the trigger word lands at the very
+    end of its sentence, carry through the immediately-following sentence so
+    the visual does not flash and vanish mid-thought."""
+    span = spans[index]
+    end = span.end
+    if span.end - anchor < 1.6 and index + 1 < len(spans):
+        nxt = spans[index + 1]
+        if nxt.start - span.end <= 1.0:
+            end = nxt.end
+    return end
 
 
 def sync_plan_to_speech(plan: DirectorPlan, words: List[TranscriptWord], duration: float, log: Any = None) -> DirectorPlan:
-    """Snap every overlay/image to the sentence the voiceover is speaking and
-    hold it until that point finishes, like a manual edit would."""
+    """Snap every overlay/image to the moment the voiceover says it, and hold
+    until that point finishes, like a manual edit would. Visuals without a
+    confident content match keep their planned timing untouched."""
     spans = speech_sentence_spans(words)
     if not spans:
         return plan
 
     synced = 0
+    unmatched = 0
     for overlay in plan.overlays:
         kind = str(overlay.get("kind") or "")
         timepoint = float(overlay.get("time") or 0)
         tokens = sync_tokens(
+            overlay.get("cue"),
             overlay.get("text"),
             overlay.get("value"),
             " ".join(str(item) for item in (overlay.get("items") or [])),
         )
-        span = best_span_for_event(spans, timepoint, tokens)
-        exact = span is not None
-        if span is None:
-            span = span_containing(spans, timepoint)
-        if span is None:
+        hit = find_speech_anchor(spans, timepoint, tokens)
+        if hit is None:
+            unmatched += 1
             continue
-        start = max(5.5, span.start if exact else timepoint)
+        index, anchor = hit
+        span = spans[index]
+        # Land on the trigger word (tiny lead), unless it opens the sentence.
+        start = span.start if anchor - span.start < 1.5 else anchor - 0.15
+        start = max(5.5, start)
         low, high = sync_duration_bounds(kind, bool(overlay.get("progressive")))
-        hold = clamp_float(span.end + 0.45 - start, low, high)
+        hold = clamp_float(speech_hold_end(spans, index, anchor) + 0.45 - start, low, high)
         if start + hold > duration - 0.5:
             hold = max(low, duration - 0.5 - start)
             if hold < low:
                 continue
         overlay["time"] = round(start, 2)
         overlay["duration"] = round(hold, 2)
-        synced += 1 if exact else 0
+        synced += 1
 
     for image in plan.images:
-        tokens = sync_tokens(image.caption, image.query)
-        span = best_span_for_event(spans, image.time, tokens, window_before=6.0, window_after=12.0)
-        exact = span is not None
-        if span is None:
-            span = span_containing(spans, image.time)
-        if span is None:
+        tokens = sync_tokens(image.cue, image.caption, image.query)
+        hit = find_speech_anchor(spans, image.time, tokens, window_before=8.0, window_after=16.0)
+        if hit is None:
+            unmatched += 1
             continue
-        start = max(3.0, span.start if exact else image.time)
-        hold = clamp_float(span.end + 0.45 - start, 3.5, 10.0)
+        index, anchor = hit
+        span = spans[index]
+        start = max(3.0, span.start if anchor - span.start < 1.5 else anchor - 0.15)
+        hold = clamp_float(speech_hold_end(spans, index, anchor) + 0.45 - start, 3.5, 8.5)
         if start + hold > duration - 1.0:
             hold = max(3.0, duration - 1.0 - start)
         image.time = round(start, 2)
         image.duration = round(hold, 2)
-        if exact:
-            synced += 1
+        synced += 1
 
     if log:
-        log(f"Speech sync: matched {synced} visual(s) to exact voiceover sentences.")
+        log(f"Speech sync: {synced} visual(s) snapped to the exact spoken moment, {unmatched} kept planned timing.")
     return resolve_visual_conflicts(plan, duration)
 
 
@@ -1862,6 +1895,7 @@ def data_viz_overlays(
                     "time": round(start + 0.4, 2),
                     "duration": 4.6,
                     "text": headline,
+                    "cue": clean_text(sentence)[:140],
                     "label": "FROM THE SCRIPT",
                     "value": value,
                     "tone": "money",
@@ -2158,6 +2192,7 @@ def sanitize_overlays(overlays: List[Dict[str, Any]], images: List[PlannedImage]
             "time": start,
             "duration": candidate_duration,
             "text": text[:74].upper(),
+            "cue": clean_text(str(raw.get("cue") or ""))[:140],
             "number": raw.get("number") if kind == "title_card" and start >= 5.5 else None,
             "accent": "yellow" if kind == "title_card" else "white",
             "sfx": sfx if sfx in {"hit", "pop", "click", "whoosh"} else "click",
@@ -2304,7 +2339,16 @@ def normalize_images(
             seen.add(key)
             i = len(unique)
             t = min(duration - 6, first_time + (i + 0.6) * usable_span / max(1, image_target))
-            unique.append(PlannedImage(index=i + 1, time=round(t, 2), duration=5.2, query=query, caption=phrase))
+            unique.append(
+                PlannedImage(
+                    index=i + 1,
+                    time=round(t, 2),
+                    duration=5.2,
+                    query=query,
+                    caption=phrase,
+                    cue=clean_text(seed)[:140],
+                )
+            )
 
     trimmed = enforce_image_spacing(unique[:image_target], duration)
     for i, image in enumerate(trimmed, start=1):
@@ -2396,13 +2440,13 @@ Return JSON with this exact shape:
   ],
   "chapters": [{{"number": 1, "start": 6, "end": 80, "title": "major section title"}}],
   "overlays": [
-    {{"kind": "soft_caption|underline_callout|strike_callout|mistake_strip|form_highlight|receipt_stack|rule_slate|deadline_flip|money_leak|checklist_reveal|document_scan|title_card|stat_counter|bar_chart|donut_chart", "time": 6.4, "duration": 3.0, "text": "short text", "value": "$1200 or 30% if transcript says it", "label": "short label", "items": ["optional", "optional"], "data": [{{"label": "401K", "value": 23000}}, {{"label": "IRA", "value": 7000}}], "meter": 0.65, "icon": "receipt|warning|calendar|dollar|check", "tone": "money|warning|deadline|audit|neutral", "number": 1, "progressive": true, "accent": "yellow|white", "sfx": "hit|pop|click|whoosh"}}
+    {{"kind": "soft_caption|underline_callout|strike_callout|mistake_strip|form_highlight|receipt_stack|rule_slate|deadline_flip|money_leak|checklist_reveal|document_scan|title_card|stat_counter|bar_chart|donut_chart", "time": 6.4, "duration": 3.0, "text": "short text", "cue": "exact words copied verbatim from the transcript at this moment", "value": "$1200 or 30% if transcript says it", "label": "short label", "items": ["optional", "optional"], "data": [{{"label": "401K", "value": 23000}}, {{"label": "IRA", "value": 7000}}], "meter": 0.65, "icon": "receipt|warning|calendar|dollar|check", "tone": "money|warning|deadline|audit|neutral", "number": 1, "progressive": true, "accent": "yellow|white", "sfx": "hit|pop|click|whoosh"}}
   ],
   "zooms": [
     {{"start": 0, "end": 5, "scale": 1.08, "x": 0, "y": 0, "mode": "flash|punch|slow|steady|settle"}}
   ],
   "images": [
-    {{"time": 45, "duration": 5.2, "query": "specific search query for useful B-roll image", "caption": "short caption"}}
+    {{"time": 45, "duration": 5.2, "query": "specific search query for useful B-roll image", "caption": "short caption", "cue": "exact words copied verbatim from the transcript at this moment"}}
   ]
 }}
 
@@ -2457,6 +2501,9 @@ Rules:
   when the transcript is discussing bought tools, subscriptions, supplies, work expenses, business expenses, or deductions.
   If the transcript says people trusted software or software handled everything, that is a mistake/cross-out moment,
   not a deduction checklist item.
+- SYNC: every overlay and image MUST include "cue": 4-10 words copied VERBATIM from the transcript at the exact
+  moment the visual should appear (the words being spoken when it pops). Do not paraphrase the cue - copy the
+  transcript words exactly. The renderer aligns each visual to the spoken audio using this cue.
 - Add value only when the script actually mentions a number, dollar amount, percent, year, or deadline.
 - Do not invent numbers, deadlines, or tax rules.
 - DATA VISUALS: every time the transcript states a real number, prefer an animated data visual over plain text.
@@ -2730,6 +2777,7 @@ def normalize_plan(data: Dict[str, Any], title: str, duration: float) -> Directo
                     "label": clean_text(str(card.get("label") or ""))[:32],
                     "items": card.get("items") if isinstance(card.get("items"), list) else [],
                     "data": card.get("data") if isinstance(card.get("data"), list) else [],
+                    "cue": clean_text(str(card.get("cue") or ""))[:140],
                     "meter": card.get("meter"),
                     "icon": str(card.get("icon") or ""),
                     "tone": str(card.get("tone") or infer_card_tone(str(card.get("text") or ""), str(card.get("kind") or ""))),
@@ -2749,6 +2797,7 @@ def normalize_plan(data: Dict[str, Any], title: str, duration: float) -> Directo
                     duration=clamp_float(image.get("duration"), 4.8, 6.8),
                     query=clean_image_query(str(image.get("query") or "")[:120]),
                     caption=clean_text(str(image.get("caption") or image.get("query") or ""))[:80],
+                    cue=clean_text(str(image.get("cue") or ""))[:140],
                 )
             )
     for raw in data.get("overlays") or []:
@@ -2767,6 +2816,7 @@ def normalize_plan(data: Dict[str, Any], title: str, duration: float) -> Directo
                 "label": clean_text(str(raw.get("label") or ""))[:32],
                 "items": raw.get("items") if isinstance(raw.get("items"), list) else [],
                 "data": raw.get("data") if isinstance(raw.get("data"), list) else [],
+                "cue": clean_text(str(raw.get("cue") or ""))[:140],
                 "meter": raw.get("meter"),
                 "icon": str(raw.get("icon") or ""),
                 "tone": str(raw.get("tone") or ""),
@@ -2804,6 +2854,7 @@ def normalize_plan(data: Dict[str, Any], title: str, duration: float) -> Directo
                 duration=clamp_float(raw.get("duration"), 4.8, 6.8),
                 query=clean_image_query(query[:120]),
                 caption=clean_text(str(raw.get("caption") or query))[:80],
+                cue=clean_text(str(raw.get("cue") or ""))[:140],
             )
         )
     if not plan.zooms:
