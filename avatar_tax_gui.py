@@ -1375,6 +1375,86 @@ def sync_token_list(*texts: Any) -> List[str]:
     return tokens
 
 
+def align_script_to_words(script_text: str, words: List[TranscriptWord]) -> Tuple[List[SpeechSpan], int]:
+    """Align the pasted/attached script to the spoken words (align_scenes
+    technique): each script sentence gets its exact start/end from the audio.
+    Sentences the ASR could not match are interpolated between their aligned
+    neighbors. Returns (spans, aligned_sentence_count)."""
+    sentences = split_sentences(script_text)
+    if not sentences or not words:
+        return [], 0
+
+    script_tokens: List[str] = []
+    token_sentence: List[int] = []
+    for index, sentence in enumerate(sentences):
+        for token in sync_token_list(sentence):
+            script_tokens.append(token)
+            token_sentence.append(index)
+    word_tokens = [(sync_token_list(word.text) or [""])[0] for word in words]
+
+    matcher = difflib.SequenceMatcher(a=script_tokens, b=word_tokens, autojunk=False)
+    count = len(sentences)
+    ranges: List[Optional[List[int]]] = [None] * count
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            sentence_index = token_sentence[block.a + offset]
+            word_index = block.b + offset
+            if ranges[sentence_index] is None:
+                ranges[sentence_index] = [word_index, word_index]
+            else:
+                ranges[sentence_index][0] = min(ranges[sentence_index][0], word_index)
+                ranges[sentence_index][1] = max(ranges[sentence_index][1], word_index)
+
+    aligned_count = sum(1 for item in ranges if item is not None)
+    starts: List[Optional[float]] = [None] * count
+    ends: List[Optional[float]] = [None] * count
+    for index, item in enumerate(ranges):
+        if item is not None:
+            starts[index] = words[item[0]].start
+            ends[index] = words[item[1]].end
+
+    total_duration = words[-1].end
+    index = 0
+    while index < count:
+        if starts[index] is not None:
+            index += 1
+            continue
+        run_start = index
+        while index < count and starts[index] is None:
+            index += 1
+        run_end = index
+        run_len = run_end - run_start
+        prev_end = ends[run_start - 1] if run_start > 0 else None
+        next_start = starts[run_end] if run_end < count else None
+        if prev_end is not None and next_start is not None:
+            lo, hi = prev_end, next_start
+        elif prev_end is not None:
+            lo, hi = prev_end, min(total_duration, prev_end + 8.0 * run_len)
+        elif next_start is not None:
+            hi = next_start
+            lo = max(0.0, hi - 8.0 * run_len)
+        else:
+            lo, hi = 0.0, total_duration
+        step = max(hi - lo, 0.1 * run_len) / run_len
+        for k in range(run_start, run_end):
+            starts[k] = lo + step * (k - run_start)
+            ends[k] = lo + step * (k - run_start + 1)
+
+    spans: List[SpeechSpan] = []
+    for index, sentence in enumerate(sentences):
+        start = float(starts[index] or 0.0)
+        end = max(float(ends[index] or 0.0), start + 0.2)
+        # Hold through natural pauses, but never past the next sentence and
+        # never more than 3s of silence.
+        if index + 1 < count and starts[index + 1] is not None:
+            next_start = float(starts[index + 1])
+            if next_start > end:
+                end = min(next_start, end + 3.0)
+        span_words = [word for word in words if start - 0.05 <= word.start <= end + 0.05]
+        spans.append(SpeechSpan(round(start, 2), round(end, 2), sentence, span_words))
+    return spans, aligned_count
+
+
 def find_cue_anchor(
     words: List[TranscriptWord],
     word_tokens: List[str],
@@ -1463,11 +1543,18 @@ def speech_hold_end(spans: List[SpeechSpan], index: int, anchor: float) -> float
     return end
 
 
-def sync_plan_to_speech(plan: DirectorPlan, words: List[TranscriptWord], duration: float, log: Any = None) -> DirectorPlan:
+def sync_plan_to_speech(
+    plan: DirectorPlan,
+    words: List[TranscriptWord],
+    duration: float,
+    log: Any = None,
+    spans: Optional[List[SpeechSpan]] = None,
+) -> DirectorPlan:
     """Snap every overlay/image to the moment the voiceover says it, and hold
     until that point finishes, like a manual edit would. Visuals without a
-    confident content match keep their planned timing untouched."""
-    spans = speech_sentence_spans(words)
+    confident content match keep their planned timing untouched. When the
+    original script was provided, `spans` are its exactly-aligned sentences."""
+    spans = spans or speech_sentence_spans(words)
     if not spans:
         return plan
     word_tokens = [(sync_token_list(word.text) or [""])[0] for word in words]
@@ -1634,6 +1721,7 @@ def enhance_director_plan(
     keep_existing_overlays: bool = True,
     transcript_chunks: Optional[List[TranscriptChunk]] = None,
     transcript_words: Optional[List[TranscriptWord]] = None,
+    script_spans: Optional[List[SpeechSpan]] = None,
     log: Any = None,
 ) -> DirectorPlan:
     plan.images = normalize_images(
@@ -1667,7 +1755,7 @@ def enhance_director_plan(
         plan.overlays = sanitize_overlays(opening + derived, plan.images, duration)
     words = transcript_words or (words_from_chunks(transcript_chunks) if transcript_chunks else [])
     if words:
-        plan = sync_plan_to_speech(plan, words, duration, log=log)
+        plan = sync_plan_to_speech(plan, words, duration, log=log, spans=script_spans)
     return plan
 
 
@@ -3407,6 +3495,14 @@ class AvatarTaxApp:
         ).grid(row=4, column=1, sticky="ew", pady=4)
         ttk.Label(form, text="Image inserts").grid(row=5, column=0, sticky="w", pady=4)
         ttk.Label(form, textvariable=self.image_policy, foreground="#555").grid(row=5, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Scripts").grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Label(
+            form,
+            text="Optional: put <video>.txt next to each avatar for exact script-first sync",
+            foreground="#555",
+            wraplength=320,
+            justify=tk.LEFT,
+        ).grid(row=6, column=1, sticky="w", pady=4)
         form.columnconfigure(1, weight=1)
 
         jobs = ttk.LabelFrame(left, text="Detected avatars")
@@ -3567,6 +3663,10 @@ class AvatarTaxApp:
         transcript = ""
         transcript_chunks: List[TranscriptChunk] = []
         transcript_words: List[TranscriptWord] = []
+        script_spans: Optional[List[SpeechSpan]] = None
+        script_text = self.load_script_for(video)
+        if script_text:
+            self.log(f"{video.name}: found script file ({len(script_text.split())} words); using script-first planning.")
         provider = transcription_key(self.transcription_provider.get())
         audio_path = work_dir / "voice.wav"
         if provider != "none":
@@ -3584,6 +3684,27 @@ class AvatarTaxApp:
                 self.log(f"{video.name}: transcription failed, continuing with local timing: {exc}")
         else:
             self.log(f"{video.name}: transcription skipped.")
+
+        if script_text:
+            align_words = transcript_words or words_from_chunks(
+                transcript_chunks or approximate_transcript_chunks(script_text, duration)
+            )
+            script_spans, aligned_count = align_script_to_words(script_text, align_words)
+            if script_spans:
+                # The written script is the source of truth: exact numbers and
+                # clean sentences for planning, exact audio times per sentence.
+                transcript = clean_text(script_text)
+                transcript_chunks = [
+                    TranscriptChunk(span.start, span.end, span.text) for span in script_spans
+                ]
+                if not transcript_words:
+                    transcript_words = align_words
+                self.log(
+                    f"{video.name}: script aligned to voiceover "
+                    f"({aligned_count}/{len(script_spans)} sentences matched exactly)."
+                )
+            else:
+                self.log(f"{video.name}: script could not be aligned; using transcript timing.")
 
         title = raw_title or display_title_from_transcript(raw_title, transcript, video.stem)
         plan_provider = provider_key(self.planning_provider.get())
@@ -3622,6 +3743,7 @@ class AvatarTaxApp:
             keep_existing_overlays=keep_existing_overlays,
             transcript_chunks=transcript_chunks,
             transcript_words=transcript_words,
+            script_spans=script_spans,
             log=self.log,
         )
         plan.title = display_title_from_transcript(plan.title, transcript, video.stem)
@@ -3641,6 +3763,23 @@ class AvatarTaxApp:
             avatar_public=avatar_public,
             plan=plan,
         )
+
+    def load_script_for(self, video: Path) -> str:
+        """Optional script-first mode: put the voiceover script next to the
+        avatar video as <videoname>.txt (or .md). Planning then uses the exact
+        written text, and WhisperX only supplies word timing for alignment."""
+        for suffix in (".txt", ".md"):
+            candidate = video.with_suffix(suffix)
+            if candidate.exists():
+                try:
+                    text = candidate.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    self.log(f"{video.name}: could not read script file {candidate.name}: {exc}")
+                    return ""
+                text = clean_text(re.sub(r"^#+\s.*$", " ", text, flags=re.MULTILINE))
+                if len(text.split()) >= 20:
+                    return text
+        return ""
 
     def transcribe_with_recovery(self, audio: Path, provider: str) -> TranscriptResult:
         while True:
